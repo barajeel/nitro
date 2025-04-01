@@ -996,7 +996,7 @@ func (s *Sequencer) precheckNonces(queueItems []txQueueItem, totalBlockSize int)
 	return outputQueueItems
 }
 
-func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
+func (s *Sequencer) createBlock(ctx context.Context) (sequencedMsg *execution.SequencedMsg, returnValue bool) {
 	var queueItems []txQueueItem
 	var totalBlockSize int
 
@@ -1069,10 +1069,10 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 					}
 					continue
 				case <-ctx.Done():
-					return false
+					return nil, false
 				default:
 					// Doesn't block if there is no transaction to process
-					return true
+					return nil, true
 				}
 			}
 		} else {
@@ -1157,11 +1157,11 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 			"totalBlockSize", totalBlockSize,
 			"maxTxDataSize", config.MaxTxDataSize,
 		)
-		return false
+		return nil, false
 	}
 
 	if s.handleInactive(ctx, queueItems) {
-		return false
+		return nil, false
 	}
 
 	timestamp := time.Now().Unix()
@@ -1181,7 +1181,7 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 			"l1Timestamp", time.Unix(int64(l1Timestamp), 0),
 			"localTimestamp", time.Unix(timestamp, 0),
 		)
-		return true
+		return nil, true
 	}
 
 	header := &arbostypes.L1IncomingMessageHeader{
@@ -1199,9 +1199,9 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 		err   error
 	)
 	if config.EnableProfiling {
-		block, err = s.execEngine.SequenceTransactionsWithProfiling(header, txes, hooks, timeboostedTxs)
+		sequencedMsg, block, err = s.execEngine.SequenceTransactionsWithProfiling(header, txes, hooks, timeboostedTxs)
 	} else {
-		block, err = s.execEngine.SequenceTransactions(header, txes, hooks, timeboostedTxs)
+		sequencedMsg, block, err = s.execEngine.SequenceTransactions(header, txes, hooks, timeboostedTxs)
 	}
 	elapsed := time.Since(start)
 	blockCreationTimer.Update(elapsed)
@@ -1220,13 +1220,13 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 		// we changed roles
 		// forward if we have where to
 		if s.handleInactive(ctx, queueItems) {
-			return false
+			return nil, false
 		}
 		// try to add back to queue otherwise
 		for _, item := range queueItems {
 			s.txRetryQueue.Push(item)
 		}
-		return false
+		return nil, false
 	}
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
@@ -1234,13 +1234,13 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 			for _, item := range queueItems {
 				s.txRetryQueue.Push(item)
 			}
-			return true // don't return failure to avoid retrying immediately
+			return nil, true // don't return failure to avoid retrying immediately
 		}
 		log.Error("error sequencing transactions", "err", err)
 		for _, queueItem := range queueItems {
 			queueItem.returnResult(err)
 		}
-		return false
+		return nil, false
 	}
 
 	if block != nil {
@@ -1273,7 +1273,7 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 		}
 		queueItem.returnResult(err)
 	}
-	return madeBlock
+	return sequencedMsg, madeBlock
 }
 
 func (s *Sequencer) updateLatestParentChainBlock(header *types.Header) {
@@ -1432,14 +1432,15 @@ func (s *Sequencer) Start(ctxIn context.Context) error {
 	return nil
 }
 
-func (s *Sequencer) Sequence(ctx context.Context) time.Duration {
+func (s *Sequencer) Sequence(ctx context.Context) (*execution.SequencedMsg, time.Duration) {
 	nextBlock := time.Now().Add(s.config().MaxBlockSpeed)
-	if s.createBlock(ctx) {
+	sequencedMsg, waitUntilSequencingNextBlock := s.createBlock(ctx)
+	if waitUntilSequencingNextBlock {
 		// Note: this may return a negative duration, but timers are fine with that (they treat negative durations as 0).
-		return time.Until(nextBlock)
+		return sequencedMsg, time.Until(nextBlock)
 	}
 	// If we didn't make a block, try again immediately.
-	return 0
+	return sequencedMsg, 0
 }
 
 type TxSource int
